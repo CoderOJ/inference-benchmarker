@@ -82,6 +82,7 @@ pub struct OpenAITextGenerationChoice {
     pub message: Option<OpenAITextGenerationMessage>,
     pub finish_reason: Option<String>,
     pub delta: Option<OpenAITextGenerationDelta>,
+    pub token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -96,6 +97,7 @@ pub struct OpenAITextGenerationRequest {
     pub max_tokens: Option<u64>,
     pub min_tokens: Option<u64>,
     pub ignore_eos: bool,
+    pub return_token_ids: bool,
     pub stream: bool,
     pub stop: Option<String>,
     pub temperature: f64,
@@ -145,6 +147,7 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
             max_tokens: request.num_decode_tokens,
             min_tokens: request.num_decode_tokens,
             ignore_eos: true,
+            return_token_ids: true,
             stream: true,
             stop: None,
             temperature: 0.0,
@@ -160,6 +163,8 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
             .timeout(self.timeout);
         // start timer
         aggregated_response.start();
+        // Restore the original timing baseline if IDs arrive after text-only chunks.
+        let mut before_text_estimates = Some(aggregated_response.clone());
         let mut es = EventSource::new(req).unwrap();
         let mut final_response = "".to_string();
         while let Some(event) = es.next().await {
@@ -187,38 +192,44 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
                                 break;
                             }
                         };
-                    let choices = oai_response.choices;
-                    let content = choices[0]
-                        .clone()
-                        .delta
-                        .unwrap()
-                        .content
-                        .unwrap_or("".to_string());
-                    if content.is_empty() {
-                        // skip empty responses
+                    let Some(choice) = oai_response.choices.into_iter().next() else {
                         continue;
+                    };
+                    let content = choice
+                        .delta
+                        .and_then(|delta| delta.content)
+                        .unwrap_or_default();
+                    let num_tokens = match choice.token_ids {
+                        Some(ids) if !ids.is_empty() => {
+                            if let Some(initial) = before_text_estimates.take() {
+                                aggregated_response = initial;
+                            }
+                            ids.len()
+                        }
+                        _ if before_text_estimates.is_some() && !content.is_empty() => {
+                            let count = self
+                                .tokenizer
+                                .encode(content.as_str(), false)
+                                .unwrap()
+                                .len();
+                            if count > 1 {
+                                warn!("Generated more than one token: {count}");
+                            }
+                            count
+                        }
+                        _ => 0,
+                    };
+                    if num_tokens > 0 {
+                        aggregated_response.add_tokens(num_tokens as u64);
                     }
-                    // we need to count the number of tokens generated as each delta chunk may contain multiple tokens
-                    // that's the case with vLLM chunked prefill or speculative decoding
-                    let num_tokens =
-                        self.tokenizer.encode(content.clone(), false).unwrap().len() as u64;
-                    if num_tokens > 1 {
-                        warn!(
-                            "Generated more than one token: {num_tokens}",
-                            num_tokens = num_tokens
+                    final_response.push_str(&content);
+                    if choice.finish_reason.is_some() {
+                        aggregated_response.stop();
+                        trace!(
+                            "Generated text using OpenAI API | prompt: {}, max tokens: {:?}, response: {}",
+                            request.prompt, request.num_decode_tokens, content
                         );
                     }
-                    match choices[0].clone().finish_reason {
-                        None => {
-                            aggregated_response.add_tokens(num_tokens);
-                            final_response += content.as_str();
-                        }
-                        Some(_) => {
-                            aggregated_response.add_tokens(num_tokens);
-                            aggregated_response.stop();
-                            trace!("Generated text using OpenAI API | prompt: {prompt}, max tokens: {max_tokens:?}, response: {message}", prompt = request.prompt, max_tokens = request.num_decode_tokens,message = &content);
-                        }
-                    };
                 }
                 Err(e) => {
                     match e {
@@ -874,6 +885,57 @@ mod tests {
             num_tokens.load(std::sync::atomic::Ordering::SeqCst),
             16 as u64
         );
+    }
+
+    #[tokio::test]
+    async fn test_openai_output_token_ids() {
+        use serde_json::json;
+
+        let mut server = mockito::Server::new_async().await;
+        let chunks = [
+            json!({"prompt_token_ids": [1, 2], "choices": [{"delta": {"role": "assistant"}}]}),
+            json!({"choices": [{"delta": {"content": "Hello"}, "token_ids": []}]}),
+            json!({"choices": [{"delta": {}, "token_ids": vec![151645; 510]}]}),
+            json!({"choices": [{"delta": {"content": "Hello, world!"}, "token_ids": [7]}]}),
+            json!({"choices": [{"delta": {"content": "text only"}}]}),
+            json!({"choices": [{"finish_reason": "length", "token_ids": [8]}]}),
+        ];
+        let mut body = String::new();
+        for chunk in chunks {
+            body.push_str(&format!("data: {chunk}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"return_token_ids": true}),
+            ))
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let backend = OpenAITextGenerationBackend::try_new(
+            String::new(),
+            server.url().parse().unwrap(),
+            "gpt2".into(),
+            tokenizer,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let request = Arc::new(TextGenerationRequest {
+            id: None,
+            prompt: "Hello".into(),
+            num_prompt_tokens: 1,
+            num_decode_tokens: Some(512),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        backend.generate(request, tx).await;
+        let response = rx.recv().await.unwrap();
+        mock.assert_async().await;
+        assert!(!response.failed);
+        assert_eq!(response.num_generated_tokens, 512);
+        assert_eq!(response.times_to_tokens.len(), 3);
     }
 
     /// Test that the timings are correct
