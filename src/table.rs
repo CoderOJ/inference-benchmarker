@@ -85,11 +85,7 @@ pub fn results_table(benchmark: BenchmarkReport) -> anyhow::Result<tabled::Table
             )
             .as_str(),
             format!("{:.2}", result.prompt_tokens_avg()?).as_str(),
-            format!(
-                "{:.2}",
-                result.total_tokens() as f64 / result.successful_requests() as f64
-            )
-            .as_str(),
+            format!("{:.2}", result.decoded_tokens_avg()?).as_str(),
         ]);
     }
     let mut table = builder.build();

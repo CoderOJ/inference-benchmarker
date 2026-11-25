@@ -46,19 +46,24 @@ impl BenchmarkResults {
     }
 
     pub fn total_requests(&self) -> usize {
-        self.aggregated_responses.len()
+        self.aggregated_responses
+            .iter()
+            .filter(|response| !response.partial)
+            .count()
     }
 
     pub fn start_time(&self) -> Option<tokio::time::Instant> {
         self.aggregated_responses
-            .first()
-            .and_then(|response| response.start_time)
+            .iter()
+            .filter_map(|response| response.start_time)
+            .min()
     }
 
     pub fn end_time(&self) -> Option<tokio::time::Instant> {
         self.aggregated_responses
-            .last()
-            .and_then(|response| response.end_time)
+            .iter()
+            .filter_map(|response| response.end_time)
+            .max()
     }
 
     fn is_ready(&self) -> bool {
@@ -68,14 +73,14 @@ impl BenchmarkResults {
     pub fn failed_requests(&self) -> usize {
         self.aggregated_responses
             .iter()
-            .filter(|response| response.failed)
+            .filter(|response| response.failed && !response.partial)
             .count()
     }
 
     pub fn successful_requests(&self) -> usize {
         self.aggregated_responses
             .iter()
-            .filter(|response| !response.failed)
+            .filter(|response| !response.failed && !response.partial)
             .count()
     }
 
@@ -121,10 +126,28 @@ impl BenchmarkResults {
     }
 
     pub fn total_tokens(&self) -> u64 {
-        self.get_successful_responses()
+        self.aggregated_responses
             .iter()
+            .filter(|response| !response.failed)
             .map(|response| response.num_generated_tokens)
             .sum()
+    }
+
+    pub fn decoded_tokens_avg(&self) -> anyhow::Result<f64> {
+        if self.is_ready() {
+            let ok = self.successful_requests();
+            if ok == 0 {
+                return Ok(0.0);
+            }
+            let completed_tokens: u64 = self
+                .get_successful_responses()
+                .iter()
+                .map(|response| response.num_generated_tokens)
+                .sum();
+            Ok(completed_tokens as f64 / ok as f64)
+        } else {
+            Err(anyhow::anyhow!(NoResponses))
+        }
     }
 
     pub fn duration(&self) -> anyhow::Result<std::time::Duration> {
@@ -230,7 +253,7 @@ impl BenchmarkResults {
     fn get_successful_responses(&self) -> Vec<&TextGenerationAggregatedResponse> {
         self.aggregated_responses
             .iter()
-            .filter(|response| !response.failed)
+            .filter(|response| !response.failed && !response.partial)
             .collect()
     }
 
@@ -241,19 +264,22 @@ impl BenchmarkResults {
     /// Calculate the quantile of a given data set using interpolation method
     /// Results are similar to `numpy.percentile`
     fn quantile_duration(&self, mut data: Vec<Duration>, quantile: f64) -> anyhow::Result<f64> {
-        if self.is_ready() {
-            data.sort();
-            let i = (quantile * (data.len() - 1) as f64).floor();
-            let delta = (data.len() - 1) as f64 * quantile - i;
-            if i as usize >= data.len() {
-                return Err(anyhow::anyhow!(NoResponses));
-            }
-            let quantile = (1. - delta) * data[i as usize].as_secs_f64()
-                + delta * data[i as usize + 1].as_secs_f64();
-            Ok(quantile)
-        } else {
-            Err(anyhow::anyhow!(NoResponses))
+        if !self.is_ready() {
+            return Err(anyhow::anyhow!(NoResponses));
         }
+        if data.is_empty() {
+            return Ok(0.0);
+        }
+        data.sort();
+        let i = (quantile * (data.len() - 1) as f64).floor();
+        let delta = (data.len() - 1) as f64 * quantile - i;
+        if i as usize >= data.len() {
+            return Err(anyhow::anyhow!(NoResponses));
+        }
+        let next = ((i as usize) + 1).min(data.len() - 1);
+        let quantile =
+            (1. - delta) * data[i as usize].as_secs_f64() + delta * data[next].as_secs_f64();
+        Ok(quantile)
     }
 }
 

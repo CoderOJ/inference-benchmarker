@@ -35,6 +35,15 @@ pub trait TextGenerationBackend: TextGenerationBackendClone {
         request: Arc<TextGenerationRequest>,
         sender: Sender<TextGenerationAggregatedResponse>,
     );
+
+    async fn generate_with_cancel(
+        &self,
+        request: Arc<TextGenerationRequest>,
+        sender: Sender<TextGenerationAggregatedResponse>,
+        _cancel: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.generate(request, sender).await;
+    }
 }
 
 pub trait TextGenerationBackendClone {
@@ -131,6 +140,16 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
         request: Arc<TextGenerationRequest>,
         sender: Sender<TextGenerationAggregatedResponse>,
     ) {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        self.generate_with_cancel(request, sender, rx).await;
+    }
+
+    async fn generate_with_cancel(
+        &self,
+        request: Arc<TextGenerationRequest>,
+        sender: Sender<TextGenerationAggregatedResponse>,
+        mut cancel: tokio::sync::oneshot::Receiver<()>,
+    ) {
         let mut url = self.base_url.clone();
         url.set_path("/v1/chat/completions");
         // let url = format!("{base_url}", base_url = self.base_url);
@@ -162,7 +181,22 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
         aggregated_response.start();
         let mut es = EventSource::new(req).unwrap();
         let mut final_response = "".to_string();
-        while let Some(event) = es.next().await {
+        loop {
+            let event = tokio::select! {
+                _ = &mut cancel => {
+                    es.close();
+                    if aggregated_response.num_generated_tokens > 0 {
+                        aggregated_response.stop();
+                        aggregated_response.partial = true;
+                        let _ = sender.send(aggregated_response).await;
+                    }
+                    return;
+                }
+                ev = es.next() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+            };
             match event {
                 Ok(Event::Open) => trace!("SSE connection opened"),
                 Ok(Event::Message(message)) => {
@@ -288,6 +322,16 @@ impl TextGenerationBackend for DummyTextGenerationBackend {
         request: Arc<TextGenerationRequest>,
         sender: Sender<crate::requests::TextGenerationAggregatedResponse>,
     ) {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        self.generate_with_cancel(request, sender, rx).await;
+    }
+
+    async fn generate_with_cancel(
+        &self,
+        request: Arc<TextGenerationRequest>,
+        sender: Sender<crate::requests::TextGenerationAggregatedResponse>,
+        mut cancel: tokio::sync::oneshot::Receiver<()>,
+    ) {
         let mut response = TextGenerationAggregatedResponse::new(request.clone());
         response.start();
         let num_tokens = request.num_decode_tokens.unwrap_or(10);
@@ -296,14 +340,22 @@ impl TextGenerationBackend for DummyTextGenerationBackend {
             .checked_div(num_tokens as u32)
             .unwrap();
         for _ in 0..num_tokens {
-            sleep(time_per_token).await;
-            response.add_tokens(1);
+            tokio::select! {
+                _ = &mut cancel => {
+                    if response.num_generated_tokens > 0 {
+                        response.stop();
+                        response.partial = true;
+                        let _ = sender.send(response).await;
+                    }
+                    return;
+                }
+                _ = sleep(time_per_token) => {
+                    response.add_tokens(1);
+                }
+            }
         }
         response.stop();
-        sender
-            .send(response.clone())
-            .await
-            .expect("Error sending response to channel");
+        let _ = sender.send(response).await;
     }
 }
 
@@ -727,6 +779,7 @@ pub struct TextGenerationAggregatedResponse {
     pub times_to_tokens: Vec<time::Duration>,
     last_received_token_time: tokio::time::Instant,
     pub failed: bool,
+    pub partial: bool,
     pub ended: bool,
     pub request: Option<Arc<TextGenerationRequest>>,
     pub response: Option<String>,
@@ -741,6 +794,7 @@ impl TextGenerationAggregatedResponse {
             times_to_tokens: Vec::new(),
             last_received_token_time: tokio::time::Instant::now(),
             failed: false,
+            partial: false,
             ended: false,
             request: Some(request),
             response: None,
@@ -755,6 +809,7 @@ impl TextGenerationAggregatedResponse {
             times_to_tokens: Vec::new(),
             last_received_token_time: tokio::time::Instant::now(),
             failed: false,
+            partial: false,
             ended: true,
             request: None,
             response: None,

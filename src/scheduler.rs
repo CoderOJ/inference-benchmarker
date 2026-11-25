@@ -97,7 +97,7 @@ impl Scheduler {
         let progress_tx = self.progress_tx.clone();
         let mut stop_receiver = self.stop_sender.subscribe();
         let req_gen = self.requests_generator.clone();
-        tokio::spawn(async move {
+        let collector = tokio::spawn(async move {
             tokio::select! {
                 _ = stop_receiver.recv() => {
                     debug!("Received stop signal, stopping benchmark");
@@ -106,8 +106,10 @@ impl Scheduler {
                     while let Some(response) = rx.recv().await{
                         // call generator callback
                         let response_txt=response.response.clone();
-                        if let Some(request)= response.request.clone(){
-                            req_gen.lock().await.callback(request, response_txt.unwrap_or_default().as_str());
+                        if !response.partial {
+                            if let Some(request)= response.request.clone(){
+                                req_gen.lock().await.callback(request, response_txt.unwrap_or_default().as_str());
+                            }
                         }
                         let result = results.clone();
                         let progress_tx = progress_tx.clone();
@@ -138,11 +140,13 @@ impl Scheduler {
                 self.stop_sender.clone(),
             )
             .await;
+        let _ = collector.await;
         warn!("{:?}", self.results.clone());
-        if self.results.lock().await.successful_requests() == 0 {
+        let res = self.results.lock().await;
+        if res.successful_requests() == 0 && res.total_tokens() == 0 {
             Err(anyhow::anyhow!(NoResponses))
         } else {
-            Ok(self.results.lock().await.clone())
+            Ok(res.clone())
         }
     }
 
